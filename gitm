@@ -1,0 +1,653 @@
+#!/usr/bin/env bash
+#
+# gitm - 用一个目录管理多个 Git 仓库，每个仓库有自己的忽略规则
+#
+# 忽略规则从 GIT_DIR/info/exclude 生效（通过 core.excludesFile），
+# 工作区里的 .gitignore 属于用户/仓库内容，gitm 不会改写它。
+#
+# 用法: gitm <git-dir> <git 命令> [参数...]
+# 示例: gitm my.git status
+#       gitm my.git log --oneline
+#       gitm my.git init
+#
+# git-dir 名称补全:
+#   仓库目录约定以 .git 结尾（仓库名 = 文件名 + .git）。
+#   只给文件名时会自动补 .git，方便「一个仓库只记录一个文件」：
+#     gitm foo.txt init      -> foo.txt.git
+#     gitm sub/bar status    -> sub/bar.git
+#   已是 .git 结尾的（含 bare 仓库 .git）原样保留。
+#   设 GITM_NO_SUFFIX=1 可关闭补全。
+#
+# init 特殊行为:
+#   git init 成功后，把「忽略所有」规则 '*' 写入 GIT_DIR/info/exclude，
+#   并让 git 通过 core.excludesFile 使用它。
+#   工作区若没有 .gitignore，就用 exclude 内容生成一份并作为第一次提交；
+#   若已有（用户自己的），原样尊重、只把它加入提交。
+#   若仓库名去掉 .git 后是工作区里的同名普通文件（foo.txt.git -> foo.txt，
+#   .foo.txt.git -> .foo.txt），该文件会一并强制加入并提交，
+#   实现「一个仓库只记录一个文件」的开箱即用。
+#   可用环境变量覆盖:
+#     GITM_INIT_MESSAGE     首次提交信息（默认 "initial commit"）
+#     GITM_KEEP_GITIGNORE   0 = 不生成 .gitignore，也不把它纳入首次提交
+#
+# clone 特殊行为:
+#   gitm <gitdir> clone <url> 改写为「裸克隆到 <gitdir>」：
+#   gitm 要求 <gitdir> 本身就是 git-dir，而 git clone 默认生成 <gitdir>/.git。
+#   克隆完成后会补上忽略规则、并把远端默认分支的内容铺到工作区，
+#   使克隆下来的仓库立刻可被 gitm 正常使用。
+#
+# 并发锁:
+#   gitm 会写仓库配置（core.excludesFile）并操作索引，因此加两把锁：
+#     工作目录锁 <CWD>/.gitm.workdir.lock   —— 串行同一工作目录下的 gitm 调用
+#     仓库锁     <真实 git-dir>/.gitm.repo.lock —— 串行同一个仓库的并发调用
+#   顺序固定「先工作目录、后仓库」，不会死锁；拿不到锁会阻塞等待。
+#   锁目录里记录 PID，异常退出（如 kill -9）留下的陈旧锁会被自动清理；
+#   可用 GITM_LOCK_TIMEOUT 设置最大重试次数（≈0.1s/次），0/未设为不限时；
+#   非整数会被忽略并提示，避免比较报错后陷入死循环。
+#   注意：锁只约束 gitm 自身，不会阻止外部 git 进程或编辑器操作同一仓库。
+#
+# clean 拦截:
+#   git clean 在这个「多仓库共用工作区」的场景里尤其危险：其它仓库跟踪的数据
+#   在本仓库看来都是「未跟踪文件」，加 -x 时连仓库目录本身都会被删除。
+#   因此 gitm 会先打印警告，要求输入 yes 确认后才放行；其它输入一律取消。
+#   拦截会跳过 git 全局选项来识别子命令，`gitm repo.git -C . clean -fdx`
+#   这类写法同样会被拦下。
+#   环境变量 GITM_CLEAN_YES=1 可跳过确认（仅在明确知道后果时使用）。
+
+set -u
+
+# ---------- 参数检查 ----------
+if [ $# -lt 1 ]; then
+    echo "用法: gitm <git-dir> <git 命令> [参数...]" >&2
+    exit 1
+fi
+
+gitdir="$1"
+shift
+
+# ---------- git-dir 名称补全 ----------
+# 仓库目录约定以 .git 结尾，支持两种形式：
+#   <名字>.git     普通形式，如 foo.txt.git
+#   .<名字>.git    隐藏形式，如 .foo.txt.git
+# 只给「裸名字」（不含 '/'、不是 . / ..、且不以 .git 结尾）时自动在两种形式间选择：
+#   1) 两个都存在 -> 报错中断，请显式写全仓库名
+#   2) 只存在一个 -> 选它（选中隐藏形式时提示一下，因为 ls 看不到）
+#   3) 都不存在   -> 按普通形式新建，即 foo.txt -> foo.txt.git
+# 已经带 .git 后缀（foo.txt.git / .foo.txt.git）视为用户明确指定，原样使用，
+# 不做任何探测或改写；显式带路径（sub/bar、/abs/name）的输入只补 .git 后缀。
+# 设 GITM_NO_SUFFIX=1 可完全关闭补全与探测。
+
+# 裸名字 -> 在 <form>.git 与 .<form>.git 之间选择，并设定全局 gitdir
+# 返回 0=已选定，1=两种形式同时存在（歧义）
+autodetect_gitdir() {
+    form="$1"
+    plain="$form.git"
+    hidden=".$form.git"
+    if [ -e "$plain" ] && [ -e "$hidden" ]; then
+        echo "gitm: 仓库名有歧义：$plain 与 $hidden 同时存在" >&2
+        echo "gitm: 请显式写全仓库名，例如：gitm $plain <命令>" >&2
+        echo "gitm:                       或：gitm $hidden <命令>" >&2
+        return 1
+    fi
+    if [ -e "$hidden" ]; then
+        if [ "$gitdir" != "$hidden" ]; then
+            echo "gitm: 检测到隐藏仓库，使用 $hidden" >&2
+        fi
+        gitdir="$hidden"
+    elif [ -e "$plain" ]; then
+        gitdir="$plain"
+    else
+        # 都没有：按字面名字新建 <名字>.git（.hidden -> .hidden.git）
+        gitdir="$plain"
+    fi
+    return 0
+}
+
+if [ "${GITM_NO_SUFFIX:-0}" != "1" ]; then
+    case "$gitdir" in
+        .)
+            # 归一化为当前目录下的 .git 仓库
+            gitdir=".git"
+            ;;
+        ..)
+            # 归一化为上级目录下的 .git 仓库
+            gitdir="../.git"
+            ;;
+        */*)
+            # 显式路径：不做探测，仅补后缀
+            case "$gitdir" in
+                *.git) ;;
+                *) gitdir="$gitdir.git" ;;
+            esac
+            ;;
+        *.git)
+            # 用户写全了仓库名，明确指定，原样使用
+            ;;
+        *)
+            # 裸名字：去掉尾部斜杠后做双形式探测
+            gitdir="${gitdir%/}"
+            [ -n "$gitdir" ] && { autodetect_gitdir "$gitdir" || exit 1; }
+            ;;
+    esac
+fi
+# 兜底：去掉可能的尾部斜杠，并保证不为空
+gitdir="${gitdir%/}"
+[ -n "$gitdir" ] || gitdir="/"
+
+exclude_file="$gitdir/info/exclude"
+work_gitignore="./.gitignore"
+
+# init 时是否把忽略规则落到工作区 .gitignore 并提交首次提交：
+#   1 = 是（默认，让 .gitignore 成为版本化内容）
+#   0 = 否，只写仓库内的 info/exclude
+keep_gitignore="${GITM_KEEP_GITIGNORE:-1}"
+
+# 首次提交的提交信息，可用 GITM_INIT_MESSAGE 覆盖
+init_message="${GITM_INIT_MESSAGE:-initial commit}"
+
+# 工作区 .gitignore 是最外层共享可变状态：各 gitm 仓库都要抢占它，
+# 同时普通 .git 仓库 / 其它 git 进程也可能读写它。这里用两把锁：
+#   1) 工作目录锁（<CWD>/.gitm.workdir.lock）—— 串行化同一工作目录下的 .gitignore 接管段
+#   2) 仓库锁（<git-dir>/.gitm.repo.lock）—— 串行化同一个仓库的并发调用
+# 获取顺序固定为「先工作目录、后仓库」，因此不会死锁。
+# mkdir 是原子操作，用它实现锁目录，并在锁内记录 PID 以便识别遗留锁。
+# 仓库锁落在真正的 git-dir 里：普通非 bare 仓库是 <dir>/.git，bare 仓库是 <dir> 本身
+repo_lock_dir="$gitdir"
+[ -d "$gitdir/.git" ] && repo_lock_dir="$gitdir/.git"
+lock_workdir="./.gitm.workdir.lock"
+lock_repo="$repo_lock_dir/.gitm.repo.lock"
+lock_workdir_held=0
+lock_repo_held=0
+
+# 超时次数必须是正整数，否则退回「不限时」——避免 [ -ge ] 报错后陷入死循环
+lock_timeout="${GITM_LOCK_TIMEOUT:-0}"
+case "$lock_timeout" in
+    ''|*[!0-9]*)
+        echo "gitm: GITM_LOCK_TIMEOUT 需要非负整数，已忽略：$lock_timeout" >&2
+        lock_timeout=0
+        ;;
+esac
+
+# 锁的持有者是否还活着（残留锁检测）
+lock_owner_alive() {
+    [ -r "$1/pid" ] || return 1
+    kill -0 "$(cat "$1/pid" 2>/dev/null)" 2>/dev/null
+}
+
+# 取锁：blocking 等待；GITM_LOCK_TIMEOUT 为最大重试次数（≈0.1s/次），0/未设=不限
+acquire_lock() {
+    lock_path="$1"
+    lock_label="$2"
+    tries=0
+    while ! mkdir "$lock_path" 2>/dev/null; do
+        tries=$((tries + 1))
+        # 上一次运行异常退出（SIGKILL 等）留下的锁：清掉后重试
+        if ! lock_owner_alive "$lock_path"; then
+            rm -rf "$lock_path" 2>/dev/null || true
+            sleep 0.05
+            continue
+        fi
+        if [ "$tries" -eq 1 ]; then
+            echo "gitm: 正在等待 ${lock_label}锁…" >&2
+        fi
+        if [ "$lock_timeout" -gt 0 ] && [ "$tries" -ge "$lock_timeout" ]; then
+            return 1
+        fi
+        sleep 0.1
+    done
+    printf '%s\n' $$ > "$lock_path/pid"
+    return 0
+}
+
+release_lock() {
+    lock_path="$1"
+    held="$2"
+    if [ "$held" -eq 1 ]; then
+        rm -rf "$lock_path" 2>/dev/null || true
+    fi
+}
+
+release_all_locks() {
+    release_lock "$lock_workdir" "$lock_workdir_held"
+    release_lock "$lock_repo" "$lock_repo_held"
+    lock_workdir_held=0
+    lock_repo_held=0
+}
+
+# ---------- 清理函数 ----------
+cleanup() {
+    # 幂等：多次调用不会出错
+    release_all_locks
+}
+
+# 无论正常退出、报错、Ctrl+C、kill、终端关闭，都执行清理
+trap 'cleanup' EXIT INT TERM HUP
+
+# ---------- 0. 先拿工作目录锁 ----------
+if ! acquire_lock "$lock_workdir" "工作目录"; then
+    echo "gitm: 获取工作目录锁超时：$lock_workdir" >&2
+    exit 1
+fi
+lock_workdir_held=1
+
+
+# ---------- 1. exclude 存在时，确保包含忽略所有规则 '*' ----------
+ensure_exclude_all() {
+    if [ ! -f "$exclude_file" ]; then
+        return 0
+    fi
+    if grep -qxF '*' "$exclude_file"; then
+        return 0
+    fi
+    # 如果文件末尾没有换行，先补一个，避免粘行
+    if [ -s "$exclude_file" ] && [ -n "$(tail -c1 "$exclude_file")" ]; then
+        printf '\n' >> "$exclude_file"
+    fi
+    printf '*\n' >> "$exclude_file" || {
+        echo "gitm: 无法写入 $exclude_file" >&2
+        return 1
+    }
+}
+
+# ---------- 2~3. 让 git 直接读本仓库的 info/exclude ----------
+# 不再把 exclude 拷贝到工作区 .gitignore：
+#   一旦临时覆盖 .gitignore，`git add -A` / `git commit -a` 就会把这份临时内容
+#   提交进历史，并让用户的 .gitignore 永久显示为已修改。
+# 改用 core.excludesfile 指向仓库内的 exclude，git 照样遵守「忽略所有」，
+# 而工作区里的 .gitignore 属于用户，gitm 绝不碰它。
+apply_exclude_config() {
+    [ -f "$exclude_file" ] || return 0
+    exclude_abs="$(cd "$(dirname "$exclude_file")" 2>/dev/null && pwd)/$(basename "$exclude_file")" || return 0
+    git --git-dir="$gitdir" config core.excludesFile "$exclude_abs" >/dev/null 2>&1 || true
+    return 0
+}
+
+# 判断参数里第一个「子命令」是不是 clean。
+# 跳过 git 的全局选项，否则 `gitm repo.git -C . clean -fdx` 这类写法会绕过拦截。
+is_clean_command() {
+    skip_value=0
+    for arg do
+        if [ "$skip_value" -eq 1 ]; then
+            skip_value=0
+            continue
+        fi
+        case "$arg" in
+            -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env)
+                skip_value=1
+                continue
+                ;;
+            -*)
+                continue
+                ;;
+            *)
+                [ "$arg" = "clean" ] && return 0
+                return 1
+                ;;
+        esac
+    done
+    return 1
+}
+
+# ---------- clean 拦截确认 ----------
+# 在 gitm 的视角里，别的仓库跟踪的数据看起来就是「未跟踪文件」，
+# 而 clean 会按当前仓库的忽略规则把它们删掉，且不可恢复。
+confirm_clean() {
+    echo "gitm: ⚠️  危险操作拦截 —— 你正在执行 git clean" >&2
+    echo >&2
+    echo "  clean 会删除当前仓库视角下「未跟踪」的文件，而且不可恢复。" >&2
+    echo "  本目录是多仓库共用同一个工作区，危害会被放大：" >&2
+    echo "    * 其它仓库正在跟踪的真实数据，在本仓库看来只是「未跟踪文件」" >&2
+    echo "    * 加上 -x 时忽略规则全部失效，连仓库目录本身（如 <repo>.git/" >&2
+    echo "      或普通仓库的 .git/）也会被当作垃圾一并删除" >&2
+    echo >&2
+    echo "  在确认之前，强烈建议先执行以下命令核对将被删除的清单：" >&2
+    echo "    gitm $gitdir clean -n -d -x      # 仅预览，不会删除" >&2
+    echo >&2
+
+    if [ "${GITM_CLEAN_YES:-0}" = "1" ]; then
+        echo "gitm: GITM_CLEAN_YES=1，跳过确认，直接执行" >&2
+        return 0
+    fi
+
+    # 决定确认输入从哪来：stdin 终端 → 直接读；stdin 有数据 → 读管道；
+    # 都没有 → 借 /dev/tty；借不到就中止（fail-safe）
+    input_src=""
+    answer=""
+    if [ -t 0 ]; then
+        input_src="stdin"
+    elif read -r answer; then
+        input_src="done"
+    elif [ -r /dev/tty ] && exec 3</dev/tty 2>/dev/null; then
+        input_src="tty"
+    else
+        echo "gitm: 非交互环境无法确认，已中止" >&2
+        return 1
+    fi
+
+    printf 'gitm: 确认执行 git clean 吗？输入 yes 继续，其它输入取消：' >&2
+    case "$input_src" in
+        stdin)
+            read -r answer || answer=""
+            ;;
+        tty)
+            read -r answer <&3 || answer=""
+            exec 3<&- 2>/dev/null || true
+            ;;
+        *)
+            # 已在探测阶段读到，answer 里就是管道输入
+            ;;
+    esac
+
+    if [ "$answer" = "yes" ]; then
+        return 0
+    fi
+    echo "gitm: 已取消，未执行 git clean" >&2
+    return 1
+}
+
+# ---------- init 特殊流程 ----------
+# init 成功后：写忽略所有规则到 exclude，重新走一遍拷贝流程，
+# 让 .gitignore 作为第一次提交；
+# 若仓库名去掉 .git 后是同名普通文件，则连它一起强制加入并提交。
+run_init() {
+    git --git-dir="$gitdir" --work-tree=. "$@"
+    exit_code=$?
+    if [ "$exit_code" -ne 0 ]; then
+        return "$exit_code"
+    fi
+
+    # 仓库目录此时已存在，取仓库锁；工作目录锁已在入口持有
+    if ! acquire_lock "$lock_repo" "仓库"; then
+        echo "gitm: 获取仓库锁超时：$lock_repo" >&2
+        return 1
+    fi
+    lock_repo_held=1
+
+    if ! ensure_exclude_all; then
+        return 1
+    fi
+    if ! apply_exclude_config; then
+        return 1
+    fi
+    if [ "$keep_gitignore" -eq 1 ] && [ ! -f "$work_gitignore" ]; then
+        # 工作区没有 .gitignore 时，用 exclude 内容生成一份并纳入版本管理；
+        # 已经存在（用户自己的）就原样尊重，绝不覆盖。
+        cp "$exclude_file" "$work_gitignore" || return 1
+    fi
+
+    # 待提交清单：.gitignore 存在就纳入（keep_gitignore=0 时不生成也不提交）
+    tracked_files=()
+    [ -f "$work_gitignore" ] && tracked_files+=("$work_gitignore")
+
+    # 仓库名 = 文件名 + .git（如 foo.txt.git / sub/bar.git），
+    # 工作区存在同名普通文件时一并跟踪。
+    # 目录名不符合该约定时候选名只是无害的猜测，文件不存在就自然跳过。
+    candidate_file="${gitdir%.git}"
+    if [ -n "$candidate_file" ] && [ -f "$candidate_file" ]; then
+        tracked_files+=("$candidate_file")
+        echo "gitm: 将一并跟踪 $candidate_file" >&2
+    fi
+
+    # 上次 init 可能给 .gitignore 打过 skip-worktree，
+    # 这会让 git add 认为路径在稀疏检出之外而失败，先清掉标记
+    git --git-dir="$gitdir" --work-tree=. update-index --no-skip-worktree -- "$work_gitignore" >/dev/null 2>&1 || true
+
+    # exclude 里的 '*' 会把文件全部忽略掉，必须 -f 强制加入
+    if ! git --git-dir="$gitdir" --work-tree=. add -f -- "${tracked_files[@]}"; then
+        echo "gitm: 添加文件失败" >&2
+        return 1
+    fi
+    # git init 是幂等的：仓库已初始化且内容没变时可能无内容可提交
+    if git --git-dir="$gitdir" --work-tree=. diff --cached --quiet -- "${tracked_files[@]}"; then
+        echo "gitm: 仓库已初始化，内容无变化，跳过首次提交" >&2
+        return 0
+    fi
+
+    if ! git --git-dir="$gitdir" --work-tree=. commit -m "$init_message" -- "${tracked_files[@]}"; then
+        echo "gitm: 首次提交失败" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# init 走独立流程：git init 成功后才生成 exclude，
+# 必须在此之后补写忽略规则、重新拷贝并完成首次提交。
+# 注意：只接管「init 且无其他参数」的形式，带参数的 init 仍按普通命令透传。
+if [ "$#" -eq 1 ] && [ "$1" = "init" ]; then
+    init_args=("$@")
+    run_init "${init_args[@]}"
+    exit_code=$?
+
+    cleanup
+    trap - EXIT INT TERM HUP
+
+    exit "$exit_code"
+fi
+
+# ---------- 1. 取仓库锁（工作目录锁已在入口持有） ----------
+# 先确认这确实是个 git 仓库再取锁，避免往普通目录里塞锁目录
+if [ -d "$repo_lock_dir" ] && [ -e "$repo_lock_dir/HEAD" ]; then
+    if ! acquire_lock "$lock_repo" "仓库"; then
+        echo "gitm: 获取仓库锁超时：$lock_repo" >&2
+        exit 1
+    fi
+    lock_repo_held=1
+fi
+
+# ---------- 2. clean 拦截：警告 + 确认后才放行 ----------
+if is_clean_command "$@"; then
+    if ! confirm_clean; then
+        exit 1
+    fi
+fi
+
+# ---------- 3. clone 特殊流程 ----------
+# gitm 要求 <gitdir> 本身就是 git-dir，而 `git clone` 默认生成
+# <gitdir>/.git 的非裸仓库，且 <gitdir> 还是空的时连 --git-dir 校验都过不了。
+# 因此这里改写为「裸克隆到 <gitdir>」+ 补忽略规则 + 检出默认分支。
+
+# 从 clone 参数里取出远端地址（跳过选项及其取值）
+clone_remote_url() {
+    skip_next=0
+    for arg do
+        if [ "$skip_next" -eq 1 ]; then
+            skip_next=0
+            continue
+        fi
+        case "$arg" in
+            --) break ;;
+            -b|--branch|--depth|--origin|-o|--reference|--reference-if-able|--separate-git-dir|--template|--config|--server-option|-c)
+                skip_next=1
+                continue
+                ;;
+            -*) continue ;;
+            *) printf '%s\n' "$arg"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# clone 参数里是否显式要求裸仓库（此时不需要再检出工作区）
+clone_wants_bare() {
+    for arg do
+        [ "$arg" = "--bare" ] && return 0
+    done
+    return 1
+}
+
+# 把 exclude 的忽略所有规则落到仓库上，并同步 core.excludesfile
+configure_clone_exclude() {
+    ensure_exclude_all || return 1
+    git --git-dir="$gitdir" config core.excludesFile "$(cd "$gitdir" && pwd)/info/exclude" >/dev/null 2>&1 || true
+    return 0
+}
+
+# 把远端默认分支的内容铺到工作区，使其立即可用。
+# 不用 `checkout -B`：在刚克隆的裸仓库上索引是空的，checkout 有清空工作区的风险。
+# read-tree + checkout-index 只写出分支里已有的文件，绝不删除工作区里的其它内容
+# （尤其是并列存在的其它 <仓库>.git/ 目录）。
+checkout_clone_default() {
+    # 注意：空仓库的 HEAD 也已经指向某个分支名（git init 的默认值），
+    # 但该分支并不存在，所以每一步都要用 show-ref 确认引用真的在。
+    branch=""
+    branch="$(git --git-dir="$gitdir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)" || branch=""
+    if [ -n "$branch" ] && ! git --git-dir="$gitdir" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        branch=""
+    fi
+    if [ -z "$branch" ]; then
+        cand="$(git --git-dir="$gitdir" symbolic-ref --short HEAD 2>/dev/null)" || cand=""
+        if [ -n "$cand" ] && git --git-dir="$gitdir" show-ref --verify --quiet "refs/heads/$cand"; then
+            branch="$cand"
+        fi
+    fi
+    if [ -z "$branch" ]; then
+        for cand in main master; do
+            if git --git-dir="$gitdir" show-ref --verify --quiet "refs/heads/$cand"; then
+                branch="$cand"
+                break
+            fi
+        done
+    fi
+    if [ -z "$branch" ]; then
+        echo "gitm: 远端没有可用于检出的默认分支，工作区保持空白" >&2
+        return 0
+    fi
+
+    if git --git-dir="$gitdir" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        start_ref="origin/$branch"
+    else
+        start_ref="$branch"
+    fi
+
+    # 工作区内容已经与分支一致时不必重复铺开
+    if [ "$(git --git-dir="$gitdir" symbolic-ref --short HEAD 2>/dev/null || printf '')" = "$branch" ] \
+        && git --git-dir="$gitdir" --work-tree=. diff --quiet HEAD -- 2>/dev/null; then
+        return 0
+    fi
+
+    git --git-dir="$gitdir" read-tree "$start_ref" || return 1
+    git --git-dir="$gitdir" symbolic-ref HEAD "refs/heads/$branch" || return 1
+    git --git-dir="$gitdir" --work-tree=. checkout-index -a -f || return 1
+    git --git-dir="$gitdir" --work-tree=. update-index --refresh >/dev/null 2>&1 || true
+    echo "gitm: 已检出默认分支 $branch" >&2
+    return 0
+}
+
+run_clone() {
+    remote_url="$(clone_remote_url "$@" || true)"
+    if [ -z "$remote_url" ]; then
+        echo "gitm: 未能从 clone 参数里识别出远端地址" >&2
+        return 1
+    fi
+
+    # 去掉 clone 子命令本身和用户可能写的 --bare，gitm 自己决定以裸形式克隆
+    filtered=()
+    for arg in "$@"; do
+        [ "$arg" = "clone" ] && continue
+        [ "$arg" = "--bare" ] && continue
+        filtered+=("$arg")
+    done
+
+    git clone --bare "${filtered[@]}" "$gitdir"
+    exit_code=$?
+    if [ "$exit_code" -ne 0 ]; then
+        return "$exit_code"
+    fi
+
+    # 仓库目录已由 clone 建好，取仓库锁
+    if ! acquire_lock "$lock_repo" "仓库"; then
+        echo "gitm: 获取仓库锁超时：$lock_repo" >&2
+        return 1
+    fi
+    lock_repo_held=1
+
+    configure_clone_exclude || return 1
+
+    if clone_wants_bare "$@"; then
+        echo "gitm: 已按 --bare 克隆，未检出工作区" >&2
+        return 0
+    fi
+
+    checkout_clone_default || return 1
+    return 0
+}
+
+
+# is_clone_command "$@"：第一个子命令是不是 clone（复用 clean 的选项跳读逻辑）
+is_clone_command() {
+    skip_value=0
+    for arg do
+        if [ "$skip_value" -eq 1 ]; then
+            skip_value=0
+            continue
+        fi
+        case "$arg" in
+            -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env)
+                skip_value=1
+                continue
+                ;;
+            -*)
+                continue
+                ;;
+            *)
+                [ "$arg" = "clone" ] && return 0
+                return 1
+                ;;
+        esac
+    done
+    return 1
+}
+
+# ---------- 4. clone 拦截：改写为 gitm 兼容的裸克隆 ----------
+if is_clone_command "$@"; then
+    # 剥掉 clone 之前可能出现的 git 全局选项，只留 clone 自己的参数
+    clone_args=()
+    skip_value=0
+    seen_clone=0
+    for arg in "$@"; do
+        if [ "$seen_clone" -eq 0 ]; then
+            if [ "$skip_value" -eq 1 ]; then
+                skip_value=0
+                continue
+            fi
+            case "$arg" in
+                -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env)
+                    skip_value=1
+                    continue
+                    ;;
+                -*) continue ;;
+                *)
+                    seen_clone=1
+                    clone_args+=("$arg")
+                    continue
+                    ;;
+            esac
+        fi
+        clone_args+=("$arg")
+    done
+
+    run_clone "${clone_args[@]}"
+    exit_code=$?
+    cleanup
+    trap - EXIT INT TERM HUP
+
+    exit "$exit_code"
+fi
+
+# ---------- 5. exclude 存在时，确保包含忽略所有规则 '*' ----------
+ensure_exclude_all || exit 1
+
+# ---------- 6. 让 git 直接读本仓库的 info/exclude ----------
+apply_exclude_config || exit 1
+
+# ---------- 7. 执行 git ----------
+git --git-dir="$gitdir" --work-tree=. "$@"
+exit_code=$?
+
+# ---------- 8. 清理 ----------
+# 由 trap EXIT 自动执行，这里显式调用一次也没问题（幂等）
+cleanup
+trap - EXIT INT TERM HUP
+
+exit $exit_code
