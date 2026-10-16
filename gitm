@@ -9,6 +9,15 @@
 # 示例: gitm my.git status
 #       gitm my.git log --oneline
 #       gitm my.git init
+#       gitm -list
+#
+# -list:
+#   列出当前目录下的 gitm 仓库（只读，不取锁）：目录名、分支、干净/改动数/领先落后。
+#   形如 -list 前缀带横杠，避免和工作区里名为 list 的仓库混淆。
+#
+# 隐私:
+#   脚本开头 umask 0077，且 init 用 git init --shared=false：
+#   新建的仓库目录与对象文件只有当前用户可读（gitm 管的是配置，常含密钥/token）。
 #
 # git-dir 名称补全:
 #   仓库目录约定以 .git 结尾（仓库名 = 文件名 + .git）。
@@ -33,8 +42,15 @@
 # clone 特殊行为:
 #   gitm <gitdir> clone <url> 改写为「裸克隆到 <gitdir>」：
 #   gitm 要求 <gitdir> 本身就是 git-dir，而 git clone 默认生成 <gitdir>/.git。
-#   克隆完成后会补上忽略规则、并把远端默认分支的内容铺到工作区，
-#   使克隆下来的仓库立刻可被 gitm 正常使用。
+#   克隆完成后会补上忽略规则、校正仓库配置、并把远端默认分支的内容铺到工作区。
+#   安全：铺开前会检查工作区是否已有同名但内容不同的文件——有就中止并列出，
+#   绝不静默覆盖（这是把 dotfiles 克隆进 $HOME 时的常见数据丢失点）。
+#   加 --force 可继续：这些文件会被另存为 <文件>.gitm-backup 后再铺开，
+#   原文件不丢；中止过的仓库保留在磁盘上，加 --force 重跑同一命令即可续做。
+#
+# 仓库配置一致性:
+#   init / clone 之后都会写入 core.bare=false 与 core.worktree=<当前目录>，
+#   使原生 git（不经过 gitm）也能直接使用这些仓库。
 #
 # 并发锁:
 #   gitm 会写仓库配置（core.excludesFile）并操作索引，因此加两把锁：
@@ -55,6 +71,48 @@
 #   环境变量 GITM_CLEAN_YES=1 可跳过确认（仅在明确知道后果时使用）。
 
 set -u
+
+# gitm 管的是配置文件，常含 token/密钥：新创建的仓库与对象只给当前用户访问
+umask 0077
+
+# ---------- -list：列出当前目录下的 gitm 仓库（只读，不取锁） ----------
+list_repos() {
+    found=0
+    for d in *.git .*.git; do
+        [ -d "$d" ] || continue
+        [ -e "$d/HEAD" ] || continue
+        [ "$d" = ".git" ] && continue
+        found=1
+
+        branch="$(git --git-dir="$d" symbolic-ref --short HEAD 2>/dev/null)" || branch=""
+        if [ -z "$branch" ] || ! git --git-dir="$d" show-ref --verify --quiet "refs/heads/$branch"; then
+            branch="-"
+            state="空仓库（还没有提交）"
+        else
+            n="$(git --git-dir="$d" --work-tree=. status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+            if [ "$n" = "0" ]; then
+                state="干净"
+            else
+                state="$n 处改动"
+            fi
+            upstream="$(git --git-dir="$d" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)" || upstream=""
+            if [ -n "$upstream" ]; then
+                ahead="$(git --git-dir="$d" rev-list --count "$upstream..HEAD" 2>/dev/null)" || ahead=0
+                behind="$(git --git-dir="$d" rev-list --count "HEAD..$upstream" 2>/dev/null)" || behind=0
+                [ "${ahead:-0}" -gt 0 ] 2>/dev/null && state="$state，领先 $ahead"
+                [ "${behind:-0}" -gt 0 ] 2>/dev/null && state="$state，落后 $behind"
+            fi
+        fi
+        printf '%-24s %-12s %s\n' "$d" "$branch" "$state"
+    done
+    [ "$found" -eq 1 ] || echo "（当前目录没有 gitm 仓库）"
+    return 0
+}
+
+if [ "${1:-}" = "-list" ]; then
+    list_repos
+    exit $?
+fi
 
 # ---------- 参数检查 ----------
 if [ $# -lt 1 ]; then
@@ -262,6 +320,17 @@ apply_exclude_config() {
     return 0
 }
 
+# 让仓库配置与 gitm 的使用方式保持一致：
+#   core.bare=false  —— 否则 `git clone --bare` 出来的仓库在原生 git 下会报
+#                       「致命错误：该操作必须在一个工作区中运行」
+#   core.worktree    —— 指明工作区，使原生 git（不经过 gitm）也能直接使用
+# gitm 自身每条命令都显式传 --work-tree，所以这两项主要是为了对外一致。
+conform_repo_config() {
+    git --git-dir="$gitdir" config core.bare false >/dev/null 2>&1 || true
+    git --git-dir="$gitdir" config core.worktree "$(pwd)" >/dev/null 2>&1 || true
+    return 0
+}
+
 # 判断参数里第一个「子命令」是不是 clean。
 # 跳过 git 的全局选项，否则 `gitm repo.git -C . clean -fdx` 这类写法会绕过拦截。
 is_clean_command() {
@@ -350,18 +419,23 @@ confirm_clean() {
 # 让 .gitignore 作为第一次提交；
 # 若仓库名去掉 .git 后是同名普通文件，则连它一起强制加入并提交。
 run_init() {
-    git --git-dir="$gitdir" --work-tree=. "$@"
+    # --shared=false：即使全局配置里开了 core.sharedRepository，也不让别人读这个仓库
+    git --git-dir="$gitdir" --work-tree=. "$@" --shared=false
     exit_code=$?
     if [ "$exit_code" -ne 0 ]; then
         return "$exit_code"
     fi
 
-    # 仓库目录此时已存在，取仓库锁；工作目录锁已在入口持有
-    if ! acquire_lock "$lock_repo" "仓库"; then
-        echo "gitm: 获取仓库锁超时：$lock_repo" >&2
-        return 1
+    # 仓库目录此时已存在，取仓库锁；工作目录锁已在入口持有。
+    # 注意：主流程可能已经取过同一把仓库锁（例如目录本来就在），不能重复取，
+    # 否则会自己等自己造成死锁。
+    if [ "$lock_repo_held" -ne 1 ]; then
+        if ! acquire_lock "$lock_repo" "仓库"; then
+            echo "gitm: 获取仓库锁超时：$lock_repo" >&2
+            return 1
+        fi
+        lock_repo_held=1
     fi
-    lock_repo_held=1
 
     if ! ensure_exclude_all; then
         return 1
@@ -369,6 +443,7 @@ run_init() {
     if ! apply_exclude_config; then
         return 1
     fi
+    conform_repo_config
     if [ "$keep_gitignore" -eq 1 ] && [ ! -f "$work_gitignore" ]; then
         # 工作区没有 .gitignore 时，用 exclude 内容生成一份并纳入版本管理；
         # 已经存在（用户自己的）就原样尊重，绝不覆盖。
@@ -450,7 +525,13 @@ fi
 # 从 clone 参数里取出远端地址（跳过选项及其取值）
 clone_remote_url() {
     skip_next=0
+    first=1
     for arg do
+        if [ "$first" -eq 1 ]; then
+            first=0
+            # 跳过开头的 clone 子命令本身
+            [ "$arg" = "clone" ] && continue
+        fi
         if [ "$skip_next" -eq 1 ]; then
             skip_next=0
             continue
@@ -474,6 +555,40 @@ clone_wants_bare() {
         [ "$arg" = "--bare" ] && return 0
     done
     return 1
+}
+
+# clone 参数里是否用了 --force（允许把已存在的同名文件另存为备份后继续）
+clone_wants_force() {
+    for arg do
+        case "$arg" in
+            -f|--force) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# 列出「分支里要写、工作区已存在、且内容不同」的文件。
+# 这些文件一旦被 checkout-index 覆盖就是用户数据丢失，必须先拦下来。
+clone_conflicts() {
+    _ref="$1"
+    git --git-dir="$gitdir" -c core.quotePath=false ls-tree -r "$_ref" 2>/dev/null |
+    while IFS="$(printf '\t')" read -r meta path; do
+        [ -n "$path" ] || continue
+        rest="${meta#* }"             # 去掉 mode
+        type="${rest%% *}"
+        sha="${rest##* }"
+        [ "$type" = "blob" ] || continue
+        [ -e "$path" ] || continue
+        if [ -L "$path" ]; then
+            printf '%s\n' "$path"
+            continue
+        fi
+        local_sha="$(git --git-dir="$gitdir" hash-object -- "$path" 2>/dev/null)" || {
+            printf '%s\n' "$path"
+            continue
+        }
+        [ "$local_sha" = "$sha" ] || printf '%s\n' "$path"
+    done
 }
 
 # 把 exclude 的忽略所有规则落到仓库上，并同步 core.excludesfile
@@ -526,6 +641,26 @@ checkout_clone_default() {
         return 0
     fi
 
+    # 铺开之前先检查会不会覆盖用户已有的文件（这是数据丢失风险点）
+    conflicts="$(clone_conflicts "$start_ref")"
+    if [ -n "$conflicts" ]; then
+        if [ "$clone_force" -ne 1 ]; then
+            echo "gitm: 克隆已中止：以下文件在工作区已存在且内容不同，铺开会覆盖它们" >&2
+            printf '%s\n' "$conflicts" | sed 's/^/  /' >&2
+            echo "gitm: 仓库已克隆到 $gitdir，不会丢弃。处理好这些文件后，加 --force 重跑同一命令" >&2
+            echo "gitm: 即可继续（gitm 会把已存在的文件另存为 <文件>.gitm-backup）" >&2
+            return 1
+        fi
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if ! mv -- "$f" "$f.gitm-backup"; then
+                echo "gitm: 备份失败，已停止：$f" >&2
+                return 1
+            fi
+            echo "gitm: 已备份 $f → $f.gitm-backup" >&2
+        done <<< "$conflicts"
+    fi
+
     git --git-dir="$gitdir" read-tree "$start_ref" || return 1
     git --git-dir="$gitdir" symbolic-ref HEAD "refs/heads/$branch" || return 1
     git --git-dir="$gitdir" --work-tree=. checkout-index -a -f || return 1
@@ -541,28 +676,43 @@ run_clone() {
         return 1
     fi
 
-    # 去掉 clone 子命令本身和用户可能写的 --bare，gitm 自己决定以裸形式克隆
+    # 去掉 clone 子命令本身、用户可能写的 --bare，以及 gitm 自己的 -f/--force
+    clone_force=0
+    clone_wants_force "$@" && clone_force=1
     filtered=()
     for arg in "$@"; do
-        [ "$arg" = "clone" ] && continue
-        [ "$arg" = "--bare" ] && continue
+        case "$arg" in
+            clone|--bare|-f|--force) continue ;;
+        esac
         filtered+=("$arg")
     done
 
-    git clone --bare "${filtered[@]}" "$gitdir"
-    exit_code=$?
-    if [ "$exit_code" -ne 0 ]; then
-        return "$exit_code"
+    # 目录已存在（例如上次因文件冲突中止，或用户已预建仓库）时不再克隆，
+    # 直接复用已有仓库继续，这样「处理好冲突后加 --force 重跑」才是可行的。
+    if [ -e "$gitdir/HEAD" ]; then
+        echo "gitm: $gitdir 已存在，跳过克隆直接继续" >&2
+        if ! git --git-dir="$gitdir" remote get-url origin >/dev/null 2>&1; then
+            git --git-dir="$gitdir" remote add origin "$remote_url" >/dev/null 2>&1 || true
+        fi
+    else
+        git clone --bare "${filtered[@]}" "$gitdir"
+        exit_code=$?
+        if [ "$exit_code" -ne 0 ]; then
+            return "$exit_code"
+        fi
     fi
 
-    # 仓库目录已由 clone 建好，取仓库锁
-    if ! acquire_lock "$lock_repo" "仓库"; then
-        echo "gitm: 获取仓库锁超时：$lock_repo" >&2
-        return 1
+    # 仓库目录已由 clone 建好，取仓库锁；主流程可能已持有同一把锁，不要重复取
+    if [ "$lock_repo_held" -ne 1 ]; then
+        if ! acquire_lock "$lock_repo" "仓库"; then
+            echo "gitm: 获取仓库锁超时：$lock_repo" >&2
+            return 1
+        fi
+        lock_repo_held=1
     fi
-    lock_repo_held=1
 
     configure_clone_exclude || return 1
+    conform_repo_config
 
     if clone_wants_bare "$@"; then
         echo "gitm: 已按 --bare 克隆，未检出工作区" >&2

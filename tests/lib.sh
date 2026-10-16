@@ -79,6 +79,22 @@ gitd() {
     git --git-dir="$repo" --work-tree=. "$@"
 }
 
+# make_remote <srcdir> <remotename> <branch> <file> <content> —— 造一个裸远端仓库
+make_remote() {
+    _srcdir="$1"; _remote="$2"; _branch="$3"; _file="$4"; _content="$5"
+    rm -rf "$_srcdir" && mkdir -p "$_srcdir"
+    (
+        cd "$_srcdir" || exit 1
+        printf '%b' "$_content" > "$_file"
+        git init -q -b "$_branch"
+        git add -A >/dev/null 2>&1
+        git commit -qm init >/dev/null 2>&1
+    )
+    rm -rf "$_remote"
+    git clone -q --bare "$_srcdir" "$_remote"
+    rm -rf "$_srcdir"
+}
+
 # 新建干净工作目录
 sandbox() {
     _sb="$(mktemp -d "${TMPDIR:-/tmp}/gitm-test-XXXXXX")"

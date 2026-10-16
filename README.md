@@ -88,6 +88,9 @@ gitm foo.txt push origin main
 # 隐藏形式的仓库也认，裸名字会自动找到它
 gitm .config.git init       # 显式新建隐藏形式
 gitm .config status         # 裸名字自动探测到 .config.git
+
+# 看看当前目录里有哪些仓库、各自什么状态
+gitm -list
 ```
 
 `gitm foo.txt init` 之后，工作区形如：
@@ -286,7 +289,8 @@ gitm:                       或：gitm .foo.txt.git <命令>
 ```
 git clone --bare <url> <gitdir>     # 让 <gitdir> 直接成为 git-dir
 + 写入「忽略所有」规则到 <gitdir>/info/exclude，并设置 core.excludesFile
-+ 把远端默认分支的内容铺到工作区（用 read-tree + checkout-index）
++ 写入 core.bare=false 与 core.worktree=<当前目录>（使原生 git 也可直接用）
++ 把远端默认分支的内容铺到工作区（read-tree + checkout-index）
 ```
 
 铺开工作区时**只写出分支里已有的文件**，不会删除工作区里的其它内容
@@ -303,6 +307,57 @@ gitm .bashrc.git clone --depth 1 --branch main <url>
 克隆下来的仓库各项都符合 gitm 的使用要求：`<gitdir>` 是 git-dir、忽略规则已就位、
 默认分支已铺到工作区、`push`/`fetch` 正常。若远端是空仓库（没有任何提交），
 工作区会保持空白，等你提交第一个版本。
+
+### 不会覆盖你已有的文件（重要）
+
+把 dotfiles 克隆进 `$HOME` 时，`$HOME` 里往往已经有同名文件。`gitm` **默认绝不静默覆盖**：
+铺开前逐个比对，凡是「分支里有、工作区已存在、内容又不同」的文件都会被拦下：
+
+```
+gitm: 克隆已中止：以下文件在工作区已存在且内容不同，铺开会覆盖它们
+  .bashrc
+  .vimrc
+gitm: 仓库已克隆到 app.git，不会丢弃。处理好这些文件后，加 --force 重跑同一命令
+gitm: 即可继续（gitm 会把已存在的文件另存为 <文件>.gitm-backup）
+```
+
+- **默认**：中止（退出码 1），你的文件原样不动；仓库已拉下来，不会白克隆一次。
+- **`--force`**：继续铺开，但先把冲突文件另存为 `<文件>.gitm-backup`，同样不丢数据。
+- 中止后**重跑同一命令加 `--force` 即可续做**（gitm 检测到仓库目录已存在会跳过克隆）。
+- 内容完全相同的文件不算冲突，不会打扰你。
+
+```bash
+gitm dotfiles.git clone <url>                 # 有冲突则中止并列出
+gitm dotfiles.git clone --force <url>         # 备份后继续
+```
+
+## `-list`：查看当前目录有哪些仓库
+
+```bash
+gitm -list
+```
+
+```
+one.txt.git              master       干净
+two.git                  master       1 处改动
+blank.git                -            空仓库（还没有提交）
+```
+
+只读、不取锁、不改动任何文件；列出的信息包括仓库目录名、当前分支、
+以及干净 / 改动数 /（有上游时）领先落后多少提交。名字带前导横杠是为了和
+工作区里可能存在的、名为 `list` 的仓库区分开。
+
+## 隐私：新建的仓库只有你能读
+
+`gitm` 管的是配置文件，常含 token、密钥（`.netrc`、`.ssh/config`、各类凭据）。
+因此脚本开头就设 `umask 0077`，且 `init` 使用 `git init --shared=false`：
+新建的仓库目录是 `700`，对象与配置文件不对外可读——即使你平时的 `umask` 是 `022`。
+
+```bash
+umask 022
+gitm .netrc init
+stat -c %a .netrc.git          # 700（不是 755）
+```
 
 ## 并发锁
 
@@ -376,6 +431,7 @@ tests/run.sh init clone   # 只跑指定分组
 | `t-clone.sh` | 裸克隆结构、默认分支铺开、`--depth/--branch/--origin/--bare`、空远端、克隆后提交/推送/切分支/合并 |
 | `t-clean.sh` | 警告文案、各种输入下的取消/放行、非交互中止、全局选项不能绕过、不误拦 |
 | `t-locks.sh` | 锁的持有与释放、跨仓库串行、陈旧锁清理、超时、同仓库并发 |
+| `t-safety.sh` | 权限收紧（`umask 0077`）、`core.bare`/`core.worktree` 一致性、`-list` |
 | `t-misc.sh` | 命令透传、忽略语义（`*` 与用户 `.gitignore` 叠加）、不改写工作区文件、边界情况 |
 
 特点：
