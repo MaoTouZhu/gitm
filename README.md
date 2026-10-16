@@ -23,11 +23,53 @@ gitm <git-dir 或 文件名> <git 命令> [参数...]
 
 ## 安装
 
-`gitm` 是自包含的单文件脚本，只依赖 `git` 和 Bash。把它放到 `PATH` 里并加上执行权限即可：
+`gitm` 是自包含的单文件脚本，只依赖 `git` 和 Bash。
+
+### 一键安装
+
+从远端克隆，复制到 `~/.local/bin`，并加上可执行权限：
 
 ```bash
-install -m 755 gitm ~/.local/bin/gitm    # 或任意在 PATH 中的目录
+git clone --depth 1 https://github.com/MaoTouZhu/gitm.git ~/.local/share/gitm \
+  && mkdir -p ~/.local/bin \
+  && install -m 755 ~/.local/share/gitm/gitm ~/.local/bin/gitm \
+  && echo "已安装: $HOME/.local/bin/gitm"
 ```
+
+如果 `~/.local/bin` 不在 `PATH` 里，追加一行（`.zshrc` 用户改成对应文件）：
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
+用 SSH 的话把地址换成 `git@github.com:MaoTouZhu/gitm.git`。
+
+### 更新
+
+```bash
+git -C ~/.local/share/gitm pull --ff-only \
+  && install -m 755 ~/.local/share/gitm/gitm ~/.local/bin/gitm
+```
+
+### 手动安装
+
+已经有一份克隆（或直接下载了脚本）时，只需放到 `PATH` 里的任意目录：
+
+```bash
+install -m 755 gitm ~/.local/bin/gitm
+```
+
+### 验证
+
+```bash
+gitm          # 应打印用法: gitm <git-dir> <git 命令> [参数...]
+```
+
+> 提交需要 Git 身份，没配过的话先设好，否则 `gitm <名字> init` 的首次提交会失败：
+> ```bash
+> git config --global user.name  "你的名字"
+> git config --global user.email "你的邮箱"
+> ```
 
 ## 快速开始
 
